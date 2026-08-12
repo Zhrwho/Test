@@ -701,12 +701,9 @@ static int parse_sei_rbsp(const uint8_t* rbsp, int len,
 {
 	int pos = 0;
 	*out_len = 0;
-
-	/* ---- pass 1: sequential walk ---- */
 	while (pos < len) {
 		int payload_type = 0;
 		int payload_size = 0;
-
 		while (pos < len) {
 			uint8_t b = rbsp[pos++];
 			payload_type += b;
@@ -719,15 +716,10 @@ static int parse_sei_rbsp(const uint8_t* rbsp, int len,
 			if (b != 0xFF)
 				break;
 		}
-
 		if (payload_type == 5) {
 			if (payload_size < 16 || pos + 16 > len)
 				return 0;
 			memcpy(uuid, rbsp + pos, 16);
-			if (!g_known_uuid_set) {
-				memcpy(g_known_uuid, uuid, 16);
-				g_known_uuid_set = 1;
-			}
 			{
 				int avail = len - pos - 16;
 				int want = payload_size - 16;
@@ -740,51 +732,13 @@ static int parse_sei_rbsp(const uint8_t* rbsp, int len,
 			}
 			return 1;
 		}
-
 		if (pos + payload_size > len)
-			break;      /* derailed: fall through to the scan below */
-
+			return 0;
 		pos += payload_size;
-	}
-
-	/* ---- pass 2: scan, but only accept the known UUID ---- */
-	if (g_known_uuid_set) {
-		int i;
-		for (i = 0; i + 1 < len; i++) {
-			int payload_size = 0;
-			int j;
-
-			if (rbsp[i] != 5)               /* payloadType == 5 */
-				continue;
-
-			j = i + 1;                      /* payloadSize */
-			while (j < len) {
-				payload_size += rbsp[j++];
-				if (rbsp[j - 1] != 0xFF)
-					break;
-			}
-
-			if (payload_size < 16 || j + 16 > len)
-				continue;
-			if (memcmp(rbsp + j, g_known_uuid, 16) != 0)
-				continue;                  /* not our SEI */
-
-			memcpy(uuid, rbsp + j, 16);
-			{
-				int avail = len - j - 16;
-				int want = payload_size - 16;
-				if (avail > want)
-					avail = want;
-				if (avail > out_cap)
-					avail = out_cap;
-				*out_len = avail > 0 ? avail : 0;
-				memcpy(out, rbsp + j + 16, *out_len);
-			}
-			return 1;
-		}
 	}
 	return 0;
 }
+
 
 
 
