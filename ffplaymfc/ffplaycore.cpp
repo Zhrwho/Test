@@ -675,8 +675,26 @@ int ffmfc_param_aframe(VideoState *is,AVFrame *pFrame,AVPacket *packet){
  * SEI (payloadType=5 user_data_unregistered) extraction helpers
  * ============================================================ */
 
- /* Iterate SEI messages inside an RBSP; return 1 when payloadType==5 found.
-  * Output: 16-byte UUID + the payload bytes after the UUID. */
+ /* Only payloadType=5 (user_data_unregistered) is extracted.
+   NOTE: DJI writes payloadSize in EBSP (raw, pre-escape) bytes, so the
+   declared size may be larger than the de-escaped RBSP. We therefore
+   never reject a type=5 for "size too big" — we clamp the data length
+   to what actually remains. */
+/*
+pass 1 顺序走：遇到 type=5，不管 size 偏不偏大，UUID 照取，
+数据按 min(声明值, 实际剩余) 截断。遇到非 type=5 且 size 越界 → 停下，交给 pass 2。
+/* Extract payloadType=5 (user_data_unregistered) only. All other SEI
+   messages are skipped. NOTE: DJI writes payloadSize in EBSP (raw,
+   pre-escape) bytes, so the declared size may exceed the de-escaped RBSP;
+   we clamp the extracted data to what actually remains instead of failing. */
+   /* Known UUID of the user_data_unregistered SEI, learned from the first hit. */
+static uint8_t g_known_uuid[16];
+static int     g_known_uuid_set = 0;
+
+/* Only payloadType=5 is extracted. DJI writes payloadSize in EBSP (raw,
+   pre-escape) bytes, so the declared size may exceed the de-escaped RBSP.
+   Pass 1 walks normally; if a message derails, pass 2 scans the NAL for a
+   type=5 whose 16-byte UUID matches the known one (no false positives). */
 static int parse_sei_rbsp(const uint8_t* rbsp, int len,
 	uint8_t uuid[16],
 	uint8_t* out, int* out_len, int out_cap)
@@ -684,53 +702,93 @@ static int parse_sei_rbsp(const uint8_t* rbsp, int len,
 	int pos = 0;
 	*out_len = 0;
 
+	/* ---- pass 1: sequential walk ---- */
 	while (pos < len) {
 		int payload_type = 0;
 		int payload_size = 0;
 
-		/* payloadType */
 		while (pos < len) {
 			uint8_t b = rbsp[pos++];
 			payload_type += b;
-
 			if (b != 0xFF)
 				break;
 		}
-
-		/* payloadSize */
 		while (pos < len) {
 			uint8_t b = rbsp[pos++];
 			payload_size += b;
-
 			if (b != 0xFF)
 				break;
 		}
 
-		if (pos + payload_size > len)
-			return 0;
-
 		if (payload_type == 5) {
-			if (payload_size < 16)
+			if (payload_size < 16 || pos + 16 > len)
 				return 0;
-
 			memcpy(uuid, rbsp + pos, 16);
-
-			*out_len = payload_size - 16;
-
-			if (*out_len > out_cap)
-				*out_len = out_cap;
-
-			memcpy(out, rbsp + pos + 16, *out_len);
-
+			if (!g_known_uuid_set) {
+				memcpy(g_known_uuid, uuid, 16);
+				g_known_uuid_set = 1;
+			}
+			{
+				int avail = len - pos - 16;
+				int want = payload_size - 16;
+				if (avail > want)
+					avail = want;
+				if (avail > out_cap)
+					avail = out_cap;
+				*out_len = avail > 0 ? avail : 0;
+				memcpy(out, rbsp + pos + 16, *out_len);
+			}
 			return 1;
 		}
 
-		/* 跳过当前 SEI payload */
+		if (pos + payload_size > len)
+			break;      /* derailed: fall through to the scan below */
+
 		pos += payload_size;
 	}
 
+	/* ---- pass 2: scan, but only accept the known UUID ---- */
+	if (g_known_uuid_set) {
+		int i;
+		for (i = 0; i + 1 < len; i++) {
+			int payload_size = 0;
+			int j;
+
+			if (rbsp[i] != 5)               /* payloadType == 5 */
+				continue;
+
+			j = i + 1;                      /* payloadSize */
+			while (j < len) {
+				payload_size += rbsp[j++];
+				if (rbsp[j - 1] != 0xFF)
+					break;
+			}
+
+			if (payload_size < 16 || j + 16 > len)
+				continue;
+			if (memcmp(rbsp + j, g_known_uuid, 16) != 0)
+				continue;                  /* not our SEI */
+
+			memcpy(uuid, rbsp + j, 16);
+			{
+				int avail = len - j - 16;
+				int want = payload_size - 16;
+				if (avail > want)
+					avail = want;
+				if (avail > out_cap)
+					avail = out_cap;
+				*out_len = avail > 0 ? avail : 0;
+				memcpy(out, rbsp + j + 16, *out_len);
+			}
+			return 1;
+		}
+	}
 	return 0;
 }
+
+
+
+
 /* Strip emulation-prevention bytes (00 00 03 -> 00 00) from one SEI NAL,
  * then look for payloadType==5. */
 //解析器改成 H.264/HEVC 兼容
@@ -738,6 +796,12 @@ static int handle_sei_nal(const uint8_t* nal, int nal_len, int is_hevc,
 	uint8_t uuid[16], uint8_t* out, int* out_len, int out_cap)
 {
 	int hdr = is_hevc ? 2 : 1;              /* HEVC NAL header = 2 bytes */
+	///* ===== DEBUG调试，看传入NAL的长度 ===== */
+	//{
+	//	char dbg[128];
+	//	sprintf(dbg, "[NAL6] nal_len=%d\n", nal_len);
+	//	OutputDebugStringA(dbg);
+	//}
 	if (nal_len < hdr + 1) return 0;
 	const uint8_t* p = nal + hdr;
 	int end = nal_len - hdr;
@@ -775,13 +839,14 @@ static int find_start_code(const uint8_t* data, int size, int from, int* sc_len)
  * NOTE: you may replace the body with your own parser, keep this signature. */
 //is_hevc，Annex B 和长度前缀两条分支都按 HEVC 判断 NAL 类型
 static int extract_user_data_sei(const uint8_t* data, int size, int is_hevc,
+	int nal_len_size, /* 0 = Annex-B (start-code), >0 = AVCC/hvcC length field size */
 	uint8_t uuid[16], uint8_t* out, int* out_len, int out_cap)
 {
 	*out_len = 0;
 	if (!data || size < 4) return 0;
 
-	int is_annexb = (data[0] == 0 && data[1] == 0 && (data[2] == 1 || data[2] == 0));
-	if (is_annexb) {
+	if (nal_len_size <= 0) {
+		/* Annex-B: split NALs by 00 00 01 / 00 00 00 01 start codes */
 		int sc_len, sc = find_start_code(data, size, 0, &sc_len);
 		while (sc >= 0) {
 			int nal_start = sc + sc_len;
@@ -800,37 +865,14 @@ static int extract_user_data_sei(const uint8_t* data, int size, int is_hevc,
 		}
 	}
 	else {
-		/* length-prefixed (AVCC/hvcC): 4-byte big-endian length by default */
-		//int i = 0, nal_len_size = 4;
-		//while (i + nal_len_size <= size) {
-		//	int len = 0, k;
-		//	for (k = 0; k < nal_len_size; k++) len = (len << 8) | data[i + k];
-		//	i += nal_len_size;
-		//	if (len <= 0 || i + len > size) break;
-		//	int type = is_hevc ? ((data[i] >> 1) & 0x3F) : (data[i] & 0x1F);
-		//	int is_sei = is_hevc ? (type == 39 || type == 40) : (type == 6);
-		//	if (is_sei &&
-		//		handle_sei_nal(data + i, len, is_hevc, uuid, out, out_len, out_cap))
-		//		return 1;
-		//	i += len;
-		//}
-/* 类型判断 加打印 调试*/
-				/* length-prefixed (AVCC/hvcC): 4-byte big-endian length by default */
-		int i = 0, nal_len_size = 4;
+		/* length-prefixed (AVCC/hvcC): NAL length field size = nal_len_size */
+		int i = 0;
 		while (i + nal_len_size <= size) {
 			int len = 0, k;
 			for (k = 0; k < nal_len_size; k++) len = (len << 8) | data[i + k];
 			i += nal_len_size;
 			if (len <= 0 || i + len > size) break;
 			int type = is_hevc ? ((data[i] >> 1) & 0x3F) : (data[i] & 0x1F);
-			/* ===== DEBUG ===== */
-			{
-				char dbg[256];
-				sprintf(dbg, "[SEI] NAL len=%d type=%d data=%02X %02X\n",
-					len, type, data[i], data[i + 1]);
-				OutputDebugStringA(dbg);
-			}
-			/* ================== */
 			int is_sei = is_hevc ? (type == 39 || type == 40) : (type == 6);
 			if (is_sei &&
 				handle_sei_nal(data + i, len, is_hevc, uuid, out, out_len, out_cap))
@@ -857,9 +899,9 @@ static void sei_queue_put(VideoState* is, int64_t dts, int64_t pts,
 	r->size = size > SEI_MAX_DATA ? SEI_MAX_DATA : size;
 	memcpy(r->data, data, r->size);
 	//调试
-	char dbg[256];
-	sprintf(dbg, "[SEI] stored dts=%lld pts=%lld size=%d\n", (long long)dts, (long long)pts, r->size);
-	OutputDebugStringA(dbg);
+	//char dbg[256];
+	//sprintf(dbg, "[SEI] stored dts=%lld pts=%lld size=%d\n", (long long)dts, (long long)pts, r->size);
+	//OutputDebugStringA(dbg);
 
 	SDL_UnlockMutex(is->sei_q_mutex);
 }
@@ -2105,9 +2147,9 @@ retry:
 				ffmfc_param_sei(is, vp->sei_uuid, vp->sei_data, vp->sei_size, vp->pts);
 
 			//调试
-			char dbg[128];
-			sprintf(dbg, "[SEI] display has_sei=%d\n", vp->has_sei);
-			OutputDebugStringA(dbg);
+			//char dbg[128];
+			//sprintf(dbg, "[SEI] display has_sei=%d\n", vp->has_sei);
+			//OutputDebugStringA(dbg);
 
 
 			/* display picture显示部分，调用 SDL 显示画面 */
@@ -3683,7 +3725,23 @@ static int read_thread(void *arg)
 		//此处设置图表参数
 
 
+		if (ret >= 0) {
 
+			if (pkt->stream_index == is->video_stream) {
+
+				printf("packet size = %d\n", pkt->size);
+
+				int n = pkt->size > 64 ? 64 : pkt->size;
+
+				for (int i = 0; i < n; i++) {
+					printf("%02X ", pkt->data[i]);
+				}
+
+				printf("\n");
+			}
+
+			// 不要在这里 unref
+		}
 
 
 
@@ -3767,40 +3825,63 @@ static int read_thread(void *arg)
 		//		sei_queue_put(is, pkt->dts, pkt->pts, uuid, sbuf, slen);
 		//}
 		/* ================================================= */
+		//
 
 		/* ===== SEI extraction (payloadType=5 user_data_unregistered) ===== */
 		if (ret >= 0 && pkt->stream_index == is->video_stream && pkt->data && pkt->size) {
 			int is_hevc = (is->video_st && is->video_st->codec &&
 				is->video_st->codec->codec_id == AV_CODEC_ID_HEVC);
+			/* 0 = Annex-B, >0 = AVCC/hvcC, value = NAL length field size */
+			int nal_len_size = 0;
+			{
+				AVCodecContext* cc = is->video_st ? is->video_st->codec : NULL;
+				if (cc && cc->extradata && cc->extradata_size > 0 && cc->extradata[0] == 1) {
+					if (is_hevc && cc->extradata_size >= 22)
+						nal_len_size = (cc->extradata[21] & 0x03) + 1;
+					else if (!is_hevc && cc->extradata_size >= 7)
+						nal_len_size = (cc->extradata[4] & 0x03) + 1;
+					else
+						nal_len_size = 4;   /* fallback */
+				}
+			}
 			uint8_t uuid[16];
 			uint8_t sbuf[SEI_MAX_DATA];
 			int slen = 0;
-			//调试
-			int found = extract_user_data_sei(pkt->data, pkt->size, is_hevc, uuid, sbuf, &slen, (int)sizeof(sbuf));
-			OutputDebugStringA(found ? "[SEI] FOUND! slen=xxx\n" : "[SEI] none\n");
+			int found = extract_user_data_sei(pkt->data, pkt->size, is_hevc, nal_len_size,
+				uuid, sbuf, &slen, (int)sizeof(sbuf));
+
+			//调试测试
+			//if (found) {
+			//	char dbg[128];
+			//	sprintf(dbg, "[SEI] FOUND! slen=%d dts=%lld pts=%lld\n", slen, (long long)pkt->dts, (long long)pkt->pts);
+			//	OutputDebugStringA(dbg);
+			//}
+			//else {
+			//	OutputDebugStringA("[SEI] none\n");
+			//}
 			if (found)
 				sei_queue_put(is, pkt->dts, pkt->pts, uuid, sbuf, slen);
-
 		}
+
 		/* ================================================================== */
 
 		//调试
 					/* ===== DEBUG: dump codec extradata ===== */
-		{
-			AVCodecContext* cc = is->video_st ? is->video_st->codec : NULL;
-			if (cc && cc->extradata && cc->extradata_size > 0) {
-				char dbg[512];
-				int n = cc->extradata_size > 200 ? 200 : cc->extradata_size;
-				int off = 0;
-				sprintf(dbg, "[XDATA] size=%d :", cc->extradata_size);
-				OutputDebugStringA(dbg);
-				for (int k = 0; k < n; k++) {
-					sprintf(dbg, "%02X ", cc->extradata[k]);
-					OutputDebugStringA(dbg);
-				}
-				OutputDebugStringA("\n");
-			}
-		}
+		//{
+		//	AVCodecContext* cc = is->video_st ? is->video_st->codec : NULL;
+		//	if (cc && cc->extradata && cc->extradata_size > 0) {
+		//		char dbg[512];
+		//		int n = cc->extradata_size > 200 ? 200 : cc->extradata_size;
+		//		int off = 0;
+		//		sprintf(dbg, "[XDATA] size=%d :", cc->extradata_size);
+		//		OutputDebugStringA(dbg);
+		//		for (int k = 0; k < n; k++) {
+		//			sprintf(dbg, "%02X ", cc->extradata[k]);
+		//			OutputDebugStringA(dbg);
+		//		}
+		//		OutputDebugStringA("\n");
+		//	}
+		//}
 		/* ===================================== */
 
 
