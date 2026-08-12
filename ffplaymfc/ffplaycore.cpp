@@ -678,38 +678,59 @@ int ffmfc_param_aframe(VideoState *is,AVFrame *pFrame,AVPacket *packet){
  /* Iterate SEI messages inside an RBSP; return 1 when payloadType==5 found.
   * Output: 16-byte UUID + the payload bytes after the UUID. */
 static int parse_sei_rbsp(const uint8_t* rbsp, int len,
-	uint8_t uuid[16], uint8_t* out, int* out_len, int out_cap)
+	uint8_t uuid[16],
+	uint8_t* out, int* out_len, int out_cap)
 {
 	int pos = 0;
 	*out_len = 0;
-	while (pos + 1 < len) {
-		int payload_type = 0, payload_size = 0;
-		/* payload_type: byte-aligned, bit7 = "more bytes follow" */
-		do {
-			if (pos >= len) return 0;
-			payload_type += (rbsp[pos] & 0x7F);
-		} while (rbsp[pos++] & 0x80);
-		/* payload_size: same scheme */
-		do {
-			if (pos >= len) return 0;
-			payload_size += (rbsp[pos] & 0x7F);
-		} while (rbsp[pos++] & 0x80);
+
+	while (pos < len) {
+		int payload_type = 0;
+		int payload_size = 0;
+
+		/* payloadType */
+		while (pos < len) {
+			uint8_t b = rbsp[pos++];
+			payload_type += b;
+
+			if (b != 0xFF)
+				break;
+		}
+
+		/* payloadSize */
+		while (pos < len) {
+			uint8_t b = rbsp[pos++];
+			payload_size += b;
+
+			if (b != 0xFF)
+				break;
+		}
 
 		if (pos + payload_size > len)
 			return 0;
-		if (payload_type == 5) {            /* user_data_unregistered */
-			if (payload_size < 16) return 0;
+
+		if (payload_type == 5) {
+			if (payload_size < 16)
+				return 0;
+
 			memcpy(uuid, rbsp + pos, 16);
+
 			*out_len = payload_size - 16;
-			if (*out_len > out_cap) *out_len = out_cap;
+
+			if (*out_len > out_cap)
+				*out_len = out_cap;
+
 			memcpy(out, rbsp + pos + 16, *out_len);
+
 			return 1;
 		}
-		pos += payload_size;                /* skip other message types */
+
+		/* 跳过当前 SEI payload */
+		pos += payload_size;
 	}
+
 	return 0;
 }
-
 /* Strip emulation-prevention bytes (00 00 03 -> 00 00) from one SEI NAL,
  * then look for payloadType==5. */
 //解析器改成 H.264/HEVC 兼容
@@ -861,6 +882,7 @@ static void sei_queue_find(VideoState* is, int64_t dts, int64_t pts)
 	is->cur_sei.has_sei = 0;
 	if (!is->sei_q_mutex) return;
 	SDL_LockMutex(is->sei_q_mutex);
+	/* 1) exact dts/pts match */
 	for (int i = 0; i < SEI_QUEUE_SIZE; i++) {
 		SEIRecord* r = &is->sei_queue[i];
 		if (!r->has_sei) continue;
@@ -868,18 +890,24 @@ static void sei_queue_find(VideoState* is, int64_t dts, int64_t pts)
 			(pts != AV_NOPTS_VALUE && r->pts == pts);
 		if (match) {
 			is->cur_sei = *r;
+			r->has_sei = 0;            /* consume so it is not reused */
 			break;
 		}
 	}
+	/* 2) fallback: take the oldest queued SEI (decode order) */
+	if (!is->cur_sei.has_sei) {
+		int first_valid = -1;
+		for (int i = 0; i < SEI_QUEUE_SIZE; i++) {
+			if (is->sei_queue[i].has_sei) { first_valid = i; break; }
+		}
+		if (first_valid >= 0) {
+			is->cur_sei = is->sei_queue[first_valid];
+			is->sei_queue[first_valid].has_sei = 0;   /* consume */
+		}
+	}
 	SDL_UnlockMutex(is->sei_q_mutex);
-
-	//调试
-	char dbg[256];
-	sprintf(dbg, "[SEI] find dts=%lld pts=%lld -> %s\n",
-		(long long)dts, (long long)pts, is->cur_sei.has_sei ? "MATCH" : "NO");
-	OutputDebugStringA(dbg);
-
 }
+
 
 //SEI输出显示，预览
 /* UI hook: called when the frame carrying SEI is displayed.
@@ -3747,23 +3775,33 @@ static int read_thread(void *arg)
 			uint8_t uuid[16];
 			uint8_t sbuf[SEI_MAX_DATA];
 			int slen = 0;
+			//调试
 			int found = extract_user_data_sei(pkt->data, pkt->size, is_hevc, uuid, sbuf, &slen, (int)sizeof(sbuf));
-			/* ===== DEBUG ===== */
-			{
-				char dbg[300];
-				sprintf(dbg, "[SEI] size=%d codecid=%d first=%02X %02X %02X %02X %02X %02X found=%d\n",
-					pkt->size,
-					(int)(is->video_st && is->video_st->codec ? is->video_st->codec->codec_id : -1),
-					pkt->data[0], pkt->data[1], pkt->data[2], pkt->data[3],
-					pkt->data[4], pkt->data[5], pkt->data[6], pkt->data[7],
-					found);
-				OutputDebugStringA(dbg);
-			}
-			/* ================ */
+			OutputDebugStringA(found ? "[SEI] FOUND! slen=xxx\n" : "[SEI] none\n");
 			if (found)
 				sei_queue_put(is, pkt->dts, pkt->pts, uuid, sbuf, slen);
+
 		}
 		/* ================================================================== */
+
+		//调试
+					/* ===== DEBUG: dump codec extradata ===== */
+		{
+			AVCodecContext* cc = is->video_st ? is->video_st->codec : NULL;
+			if (cc && cc->extradata && cc->extradata_size > 0) {
+				char dbg[512];
+				int n = cc->extradata_size > 200 ? 200 : cc->extradata_size;
+				int off = 0;
+				sprintf(dbg, "[XDATA] size=%d :", cc->extradata_size);
+				OutputDebugStringA(dbg);
+				for (int k = 0; k < n; k++) {
+					sprintf(dbg, "%02X ", cc->extradata[k]);
+					OutputDebugStringA(dbg);
+				}
+				OutputDebugStringA("\n");
+			}
+		}
+		/* ===================================== */
 
 
 
