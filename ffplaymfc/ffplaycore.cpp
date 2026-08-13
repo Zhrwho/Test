@@ -800,18 +800,38 @@ static int find_start_code(const uint8_t* data, int size, int from, int* sc_len)
  * find SEI NALs (nal_unit_type == 6) and extract payloadType==5.
  * NOTE: you may replace the body with your own parser, keep this signature. */
 //is_hevc，Annex B 和长度前缀两条分支都按 HEVC 判断 NAL 类型
+//改为UUID直扫版
 static int extract_user_data_sei(const uint8_t* data, int size, int is_hevc,
 	int nal_len_size, /* 0 = Annex-B (start-code), >0 = AVCC/hvcC length field size */
 	uint8_t uuid[16], uint8_t* out, int* out_len, int out_cap)
 {
 	*out_len = 0;
-	if (!data || size < 4) return 0;
+	if (!data || size < 16) return 0;
 
-	//调试丢帧
-	//printf("[SEI FUNC] size=%d nal_len_size=%d\n",
-	//	size, nal_len_size);
+	/* Pass A: UUID known - scan the raw packet bytes for it directly.
+	   Bypasses NAL-length / EPB / SEI-size quirks entirely. */
+	if (g_known_uuid_set) {
+		int i;
+		for (i = 0; i + 16 <= size; i++) {
+			int n;
+			if (memcmp(data + i, g_known_uuid, 16) != 0)
+				continue;
+			if (i < 2 || data[i - 2] != 5)
+				continue;              /* must be preceded by type=5 header */
+			n = data[i - 1] - 16;      /* single-byte payload size field */
+			if (n < 0) continue;
+			if (n > out_cap) n = out_cap;
+			if (i + 16 + n > size) n = size - i - 16;
+			if (n <= 0) continue;
+			memcpy(uuid, data + i, 16);
+			*out_len = n;
+			memcpy(out, data + i + 16, *out_len);
+			return 1;
+		}
+		return 0;
+	}
 
-
+	/* Pass B: UUID not known yet - walk NALs once to discover it. */
 	if (nal_len_size <= 0) {
 		/* Annex-B: split NALs by 00 00 01 / 00 00 00 01 start codes */
 		int sc_len, sc = find_start_code(data, size, 0, &sc_len);
@@ -825,8 +845,11 @@ static int extract_user_data_sei(const uint8_t* data, int size, int is_hevc,
 				int is_sei = is_hevc ? (type == 39 || type == 40) : (type == 6);
 				if (is_sei &&
 					handle_sei_nal(data + nal_start, nal_end - nal_start, is_hevc,
-						uuid, out, out_len, out_cap))
+						uuid, out, out_len, out_cap)) {
+					memcpy(g_known_uuid, uuid, 16);
+					g_known_uuid_set = 1;
 					return 1;
+				}
 			}
 			sc = next;
 		}
@@ -839,16 +862,16 @@ static int extract_user_data_sei(const uint8_t* data, int size, int is_hevc,
 			for (k = 0; k < nal_len_size; k++) len = (len << 8) | data[i + k];
 			i += nal_len_size;
 			if (len <= 0 || i + len > size) break;
-			int type = is_hevc ? ((data[i] >> 1) & 0x3F) : (data[i] & 0x1F);
-			int is_sei = is_hevc ? (type == 39 || type == 40) : (type == 6);
-			//调试，看是否划分NAL正确
-			//printf("[NAL] offset=%d len=%d type=%d\n",
-			//	i, len, type);
-
-			//防竞争字节头处理；
-			if (is_sei &&
-				handle_sei_nal(data + i, len, is_hevc, uuid, out, out_len, out_cap))
-				return 1;
+			{
+				int type = is_hevc ? ((data[i] >> 1) & 0x3F) : (data[i] & 0x1F);
+				int is_sei = is_hevc ? (type == 39 || type == 40) : (type == 6);
+				if (is_sei &&
+					handle_sei_nal(data + i, len, is_hevc, uuid, out, out_len, out_cap)) {
+					memcpy(g_known_uuid, uuid, 16);
+					g_known_uuid_set = 1;
+					return 1;
+				}
+			}
 			i += len;
 		}
 	}
@@ -899,43 +922,20 @@ static void sei_queue_find(VideoState* is, int64_t dts, int64_t pts)
 	is->cur_sei.has_sei = 0;
 	if (!is->sei_q_mutex) return;
 	SDL_LockMutex(is->sei_q_mutex);
-
-	if (dts != AV_NOPTS_VALUE) {
-		/* SEI belongs to the access unit it precedes: in decode order its
-		   dts is <= the frame's dts. Take the queued SEI with the largest
-		   dts <= frame dts (floor match). Never consume a SEI whose dts is
-		   larger than the frame's dts -- read_thread queues ahead of the
-		   decoder, so that is a FUTURE frame's SEI. */
-		SEIRecord* best = NULL;
-		for (int i = 0; i < SEI_QUEUE_SIZE; i++) {
-			SEIRecord* r = &is->sei_queue[i];
-			if (!r->has_sei || r->dts == AV_NOPTS_VALUE) continue;
-			if (r->dts <= dts && (!best || r->dts >= best->dts))
-				best = r;
-		}
-		if (best) {
-			is->cur_sei = *best;
-			best->has_sei = 0;         /* consume so it is not reused */
+	/* 1) exact dts/pts match */
+	for (int i = 0; i < SEI_QUEUE_SIZE; i++) {
+		SEIRecord* r = &is->sei_queue[i];
+		if (!r->has_sei) continue;
+		int match = (dts != AV_NOPTS_VALUE && r->dts == dts) ||
+			(pts != AV_NOPTS_VALUE && r->pts == pts);
+		if (match) {
+			is->cur_sei = *r;
+			r->has_sei = 0;            /* consume so it is not reused */
+			break;
 		}
 	}
-	else if (pts != AV_NOPTS_VALUE) {
-		/* no dts: floor-match by pts. Only safe when pts is monotonic in
-		   decode order (stream without B-frame reordering). */
-		SEIRecord* best = NULL;
-		for (int i = 0; i < SEI_QUEUE_SIZE; i++) {
-			SEIRecord* r = &is->sei_queue[i];
-			if (!r->has_sei || r->pts == AV_NOPTS_VALUE) continue;
-			if (r->pts <= pts && (!best || r->pts >= best->pts))
-				best = r;
-		}
-		if (best) {
-			is->cur_sei = *best;
-			best->has_sei = 0;         /* consume so it is not reused */
-		}
-	}
-	else {
-		/* neither dts nor pts present: pure FIFO, oldest first. Only valid
-		   when the stream has no timestamps at all. */
+	/* 2) fallback: take the oldest queued SEI (decode order) */
+	if (!is->cur_sei.has_sei) {
 		int first_valid = -1;
 		for (int i = 0; i < SEI_QUEUE_SIZE; i++) {
 			if (is->sei_queue[i].has_sei) { first_valid = i; break; }
