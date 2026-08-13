@@ -695,6 +695,7 @@ static int     g_known_uuid_set = 0;
    pre-escape) bytes, so the declared size may exceed the de-escaped RBSP.
    Pass 1 walks normally; if a message derails, pass 2 scans the NAL for a
    type=5 whose 16-byte UUID matches the known one (no false positives). */
+//对去掉防竞争字节头的RBSP数据进行处理；
 static int parse_sei_rbsp(const uint8_t* rbsp, int len,
 	uint8_t uuid[16],
 	uint8_t* out, int* out_len, int out_cap)
@@ -704,27 +705,35 @@ static int parse_sei_rbsp(const uint8_t* rbsp, int len,
 	while (pos < len) {
 		int payload_type = 0;
 		int payload_size = 0;
+		//一个SEI NAL里面可能有多个SEI message 
 		while (pos < len) {
 			uint8_t b = rbsp[pos++];
 			payload_type += b;
+			//对超过255的playloadtype 进行分析；
 			if (b != 0xFF)
 				break;
 		}
+
 		while (pos < len) {
 			uint8_t b = rbsp[pos++];
 			payload_size += b;
 			if (b != 0xFF)
 				break;
 		}
+		//user_data_unregistered
 		if (payload_type == 5) {
 			if (payload_size < 16 || pos + 16 > len)
 				return 0;
+			//复制 16 字节
 			memcpy(uuid, rbsp + pos, 16);
 			{
+				//RBSP 实际还剩多少数据
 				int avail = len - pos - 16;
+				//理论上想读取多少用户数据
 				int want = payload_size - 16;
 				if (avail > want)
 					avail = want;
+				//out_cap 是防止输出缓冲区溢出
 				if (avail > out_cap)
 					avail = out_cap;
 				*out_len = avail > 0 ? avail : 0;
@@ -741,8 +750,6 @@ static int parse_sei_rbsp(const uint8_t* rbsp, int len,
 
 
 
-
-
 /* Strip emulation-prevention bytes (00 00 03 -> 00 00) from one SEI NAL,
  * then look for payloadType==5. */
 //解析器改成 H.264/HEVC 兼容
@@ -751,6 +758,7 @@ static int handle_sei_nal(const uint8_t* nal, int nal_len, int is_hevc,
 {
 	int hdr = is_hevc ? 2 : 1;              /* HEVC NAL header = 2 bytes */
 	///* ===== DEBUG调试，看传入NAL的长度 ===== */
+
 	//{
 	//	char dbg[128];
 	//	sprintf(dbg, "[NAL6] nal_len=%d\n", nal_len);
@@ -799,6 +807,11 @@ static int extract_user_data_sei(const uint8_t* data, int size, int is_hevc,
 	*out_len = 0;
 	if (!data || size < 4) return 0;
 
+	//调试丢帧
+	//printf("[SEI FUNC] size=%d nal_len_size=%d\n",
+	//	size, nal_len_size);
+
+
 	if (nal_len_size <= 0) {
 		/* Annex-B: split NALs by 00 00 01 / 00 00 00 01 start codes */
 		int sc_len, sc = find_start_code(data, size, 0, &sc_len);
@@ -828,6 +841,11 @@ static int extract_user_data_sei(const uint8_t* data, int size, int is_hevc,
 			if (len <= 0 || i + len > size) break;
 			int type = is_hevc ? ((data[i] >> 1) & 0x3F) : (data[i] & 0x1F);
 			int is_sei = is_hevc ? (type == 39 || type == 40) : (type == 6);
+			//调试，看是否划分NAL正确
+			//printf("[NAL] offset=%d len=%d type=%d\n",
+			//	i, len, type);
+
+			//防竞争字节头处理；
 			if (is_sei &&
 				handle_sei_nal(data + i, len, is_hevc, uuid, out, out_len, out_cap))
 				return 1;
@@ -873,25 +891,51 @@ static void sei_queue_clear(VideoState* is)
 /* Look up the SEI that belongs to the frame just decoded, identified by
  * its packet dts/pts. On hit, copy it into is->cur_sei. This keeps SEI
  * aligned with the displayed frame even when B-frames are reordered. */
+//dts <= 当前帧 dts 的 SEI 中 dts 最大的那条，绝不消费 dts > 当前帧 dts 的（那是未来帧的）
+//SEI 与切片同包时，r->dts == 帧dts 精确命中（floor 包含等号）；SEI 独立包时命中 r->dts < 帧dts；帧没有 SEI 时返回空（不会偷走下一帧的 SEI）。
+// B 帧/POC 重排不受影响——匹配发生在解码期（dts 序），绑定后随 VideoPicture 走 pictq。
 static void sei_queue_find(VideoState* is, int64_t dts, int64_t pts)
 {
 	is->cur_sei.has_sei = 0;
 	if (!is->sei_q_mutex) return;
 	SDL_LockMutex(is->sei_q_mutex);
-	/* 1) exact dts/pts match */
-	for (int i = 0; i < SEI_QUEUE_SIZE; i++) {
-		SEIRecord* r = &is->sei_queue[i];
-		if (!r->has_sei) continue;
-		int match = (dts != AV_NOPTS_VALUE && r->dts == dts) ||
-			(pts != AV_NOPTS_VALUE && r->pts == pts);
-		if (match) {
-			is->cur_sei = *r;
-			r->has_sei = 0;            /* consume so it is not reused */
-			break;
+
+	if (dts != AV_NOPTS_VALUE) {
+		/* SEI belongs to the access unit it precedes: in decode order its
+		   dts is <= the frame's dts. Take the queued SEI with the largest
+		   dts <= frame dts (floor match). Never consume a SEI whose dts is
+		   larger than the frame's dts -- read_thread queues ahead of the
+		   decoder, so that is a FUTURE frame's SEI. */
+		SEIRecord* best = NULL;
+		for (int i = 0; i < SEI_QUEUE_SIZE; i++) {
+			SEIRecord* r = &is->sei_queue[i];
+			if (!r->has_sei || r->dts == AV_NOPTS_VALUE) continue;
+			if (r->dts <= dts && (!best || r->dts >= best->dts))
+				best = r;
+		}
+		if (best) {
+			is->cur_sei = *best;
+			best->has_sei = 0;         /* consume so it is not reused */
 		}
 	}
-	/* 2) fallback: take the oldest queued SEI (decode order) */
-	if (!is->cur_sei.has_sei) {
+	else if (pts != AV_NOPTS_VALUE) {
+		/* no dts: floor-match by pts. Only safe when pts is monotonic in
+		   decode order (stream without B-frame reordering). */
+		SEIRecord* best = NULL;
+		for (int i = 0; i < SEI_QUEUE_SIZE; i++) {
+			SEIRecord* r = &is->sei_queue[i];
+			if (!r->has_sei || r->pts == AV_NOPTS_VALUE) continue;
+			if (r->pts <= pts && (!best || r->pts >= best->pts))
+				best = r;
+		}
+		if (best) {
+			is->cur_sei = *best;
+			best->has_sei = 0;         /* consume so it is not reused */
+		}
+	}
+	else {
+		/* neither dts nor pts present: pure FIFO, oldest first. Only valid
+		   when the stream has no timestamps at all. */
 		int first_valid = -1;
 		for (int i = 0; i < SEI_QUEUE_SIZE; i++) {
 			if (is->sei_queue[i].has_sei) { first_valid = i; break; }
@@ -2421,7 +2465,9 @@ static int get_video_frame(VideoState *is, AVFrame *frame, int64_t *pts, AVPacke
 		return -1;
 	//flush_pkt 特殊pkt,告诉解码线程，换位置了，把旧东西清掉
 	if (pkt->data == flush_pkt.data) {
-		avcodec_flush_buffers(is->video_st->codec);//清空内部缓存
+		sei_queue_clear(is);          /* drop stale SEI on seek/flush */
+		avcodec_flush_buffers(is->video_st->codec);//清空内部缓冲区
+
 
 		SDL_LockMutex(is->pictq_mutex);
 		// Make sure there are no long delay timers (ideally we should just flush the que but thats harder)
@@ -2448,8 +2494,8 @@ static int get_video_frame(VideoState *is, AVFrame *frame, int64_t *pts, AVPacke
 	//H264有I P B帧，解码一个pkt不一定成功得到图片，所以got_picture表示解码成功后的处理
 	//帧匹配
 	if (got_picture) {
-		/* Match this output frame's SEI by its identity (dts/pts) */
-		sei_queue_find(is, frame->pkt_dts, frame->pkt_pts);
+		///* Match this output frame's SEI by its identity (dts/pts) */
+		//sei_queue_find(is, frame->pkt_dts, frame->pkt_pts);
 
 		//注意：此处设置MFC参数！
 		ffmfc_param_vframe(is,frame,pkt);
@@ -2493,7 +2539,12 @@ static int get_video_frame(VideoState *is, AVFrame *frame, int64_t *pts, AVPacke
 				}
 				SDL_UnlockMutex(is->pictq_mutex);
 		}
-
+		/* 只有确认本帧不会被丢帧（会真正进 pictq 显示）时才消费 SEI，
+		   否则丢帧时 SEI 记录被消费掉却没有帧带走它 -> 静默丢失。 */
+		if (ret) {
+			/* Match this output frame's SEI by its identity (dts/pts) */
+			sei_queue_find(is, frame->pkt_dts, frame->pkt_pts);
+		}
 		return ret;
 	}
 	return 0;
@@ -3801,6 +3852,13 @@ static int read_thread(void *arg)
 			uint8_t uuid[16];
 			uint8_t sbuf[SEI_MAX_DATA];
 			int slen = 0;
+
+			//调试
+			//printf("[PACKET] pts=%lld flags=0x%x size=%d\n",
+			//	(long long)pkt->pts,
+			//	pkt->flags,
+			//	pkt->size);
+
 			int found = extract_user_data_sei(pkt->data, pkt->size, is_hevc, nal_len_size,
 				uuid, sbuf, &slen, (int)sizeof(sbuf));
 
@@ -3813,6 +3871,7 @@ static int read_thread(void *arg)
 			//else {
 			//	OutputDebugStringA("[SEI] none\n");
 			//}
+
 			if (found)
 				sei_queue_put(is, pkt->dts, pkt->pts, uuid, sbuf, slen);
 		}
